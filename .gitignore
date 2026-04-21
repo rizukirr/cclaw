@@ -1,0 +1,34 @@
+# Build
+build/
+out/
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# Environment
+.env
+.env.*
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compile commands
+compile_commands.json
+/.no-vibe
+/.omc
+/.codex
+/.omx
+/CLAUDE.md
+/package-lock.json
