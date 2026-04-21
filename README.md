@@ -1,11 +1,8 @@
 # CClaw
 
 > ## Warning
-> 
 > This repository is an early-stage work in progress.
-> 
 > It is not ready for production use yet, and there is nothing broadly useful for end users at this time.
-> 
 > Expect frequent breaking changes while the architecture is still being built.
 
 ## What this repository is
