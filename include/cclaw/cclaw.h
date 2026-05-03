@@ -2,6 +2,7 @@
 #define CCLAW_H
 
 #include "str.h"
+#include "tool.h"
 
 typedef struct CClaw CClaw;
 
@@ -14,6 +15,7 @@ CClaw *cclaw_init(void);
 CClawString cclaw_chat(CClaw *ctx, const char *prompt);
 int cclaw_chat_stream(CClaw *ctx, const char *prompt,
                       CClawStreamCallback on_chunk, void *userdata);
+int cclaw_tool_register(CClaw *ctx, const CClawTool *tool);
 void cclaw_destroy(CClaw *ctx);
 
 #endif

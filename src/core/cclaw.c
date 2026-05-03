@@ -4,6 +4,7 @@
 #include "cclaw/error.h"
 #include "internal.h"
 #include "lib/libenv.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 CClaw *cclaw_init(void) {
@@ -71,4 +72,19 @@ void cclaw_destroy(CClaw *ctx) {
     ctx->provider->free(ctx->provider);
   arena_free(ctx->arena);
   free(ctx);
+}
+
+int cclaw_tool_register(CClaw *ctx, const CClawTool *tool) {
+  if (!ctx || !tool || !tool->fn) {
+    cclaw_strerror(CCLAW_INVALID, "tool_register: bad args");
+    return CCLAW_INVALID;
+  }
+
+  if (ctx->tool_count >= CCLAW_MAX_TOOLS) {
+    cclaw_strerror(CCLAW_INVALID, "tool_register: too many tools");
+    return CCLAW_INVALID;
+  }
+
+  ctx->tools[ctx->tool_count++] = *tool;
+  return 0;
 }
