@@ -86,6 +86,7 @@ add_library(cclaw_lib STATIC
     src/provider/openai.c
     src/provider/registry.c
     src/tui/tui.c
+    src/tui/repl.c
 )
 
 

@@ -34,17 +34,28 @@ typedef struct {
   int draw_w;
 } TUILayout;
 
+typedef enum { NORMAL, PLAN } Mode;
+
+// TODO: need to integrate with TUI
+typedef struct {
+  Mode mode;
+  char *model;
+  char *provider;
+  size_t tokens;
+  bool stream;
+} Status;
+
 typedef struct {
   char input[INPUT_MAX];
   char pending_prompt[LAST_SUBMIT_MAX];
   char status_msg[STATUS_MSG_MAX];
   int pending_send;
-  int use_stream;
   size_t scroll_offset;
   size_t input_len;
   size_t cursor;
   size_t preferred_col;
   ChatLog log;
+  Status status;
 } TUIState;
 
 static void log_push(ChatLog *log, const char *text, uintattr_t color) {
@@ -87,7 +98,7 @@ static JsonSlice extract_output_text(Response response) {
 
 static TUIState tui_state_init(void) {
   TUIState state = {0};
-  state.use_stream = 1;
+  state.status.stream = true;
   snprintf(state.status_msg, sizeof(state.status_msg),
            "status: ready (stream:on)");
 
@@ -318,7 +329,7 @@ static int tui_stream_on_chunk(const char *chunk, size_t len, void *userdata) {
 }
 
 static void tui_process_chat(CClaw *ctx, TUIState *st) {
-  if (st->use_stream) {
+  if (st->status.stream) {
     log_push(&st->log, "", TB_DEFAULT);
     int rc =
         cclaw_chat_stream(ctx, st->pending_prompt, tui_stream_on_chunk, st);
@@ -368,21 +379,21 @@ static inline TUIEvent tui_handle_command(TUIState *st, const char *cmd) {
     return TUI_EVENT_BREAK;
 
   if (strcmp(cmd, "/stream on") == 0) {
-    st->use_stream = 1;
+    st->status.stream = true;
     snprintf(st->status_msg, sizeof(st->status_msg),
              "status: ready (stream:on)");
     return TUI_EVENT_CONTINUE;
   }
 
   if (strcmp(cmd, "/stream off") == 0) {
-    st->use_stream = 0;
+    st->status.stream = false;
     snprintf(st->status_msg, sizeof(st->status_msg),
              "status: ready (stream:off)");
     return TUI_EVENT_CONTINUE;
   }
 
   if (strcmp(cmd, "/stream") == 0) {
-    log_push(&st->log, st->use_stream ? "stream:on" : "stream:off", TB_CYAN);
+    log_push(&st->log, st->status.stream ? "stream:on" : "stream:off", TB_CYAN);
     return TUI_EVENT_CONTINUE;
   }
 

@@ -1,0 +1,10 @@
+#ifndef CCLAW_EVENT_H
+#define CCLAW_EVENT_H
+
+typedef enum {
+  CCLAW_EVENT_OK,
+  CCLAW_EVENT_BREAK,
+  CCLAW_EVENT_CONTINUE
+} CClawEvent;
+
+#endif // CCLAW_EVENT_H
