@@ -1,6 +1,7 @@
 #ifndef CCLAW_RESPONSE_H
 #define CCLAW_RESPONSE_H
 
+#include "cclaw/cclaw.h"
 #include "cclaw/str.h"
 #include "lib/libjson.h"
 
@@ -23,6 +24,9 @@ typedef struct {
   JsonSlice type;
   JsonSlice summary;
   JsonSlice role;
+  JsonSlice call_id;
+  JsonSlice name;
+  JsonSlice arguments;
   Content content[MAX_CONTENT];
 } Output;
 
@@ -38,13 +42,19 @@ typedef struct {
 } Usage;
 
 typedef struct {
+  JsonSlice message;
+  JsonSlice type;
+  JsonSlice param;
+  JsonSlice code;
+} ErrorResponse;
+
+typedef struct {
   JsonSlice id;
   JsonSlice object;
   JsonSlice created_at;
   JsonSlice status;
   JsonSlice background;
   JsonSlice completed_at;
-  JsonSlice error;
   JsonSlice frequency_penalty;
   JsonSlice incomplete_details;
   JsonSlice instructions;
@@ -72,7 +82,10 @@ typedef struct {
   Output output[MAX_OUTPUT];
   Reasoning reasoning;
   Usage usage;
+  ErrorResponse error;
 } Response;
 
+int cclaw_is_response_error(CClaw *ctx, CClawString res);
+Response cclaw_response_error_from_json(const CClawString json);
 Response cclaw_response_from_json(const CClawString json);
 #endif // CCLAW_RESPONSE_H

@@ -1,5 +1,50 @@
 #define LIBJSON_IMPLEMENTATION
 #include "cclaw/response.h"
+#include "cclaw/error.h"
+#include "core/internal.h"
+
+int cclaw_is_response_error(CClaw *ctx, CClawString res) {
+  JsonSlice root = json_from_parts(res.str, res.len);
+  JsonSlice err = {0};
+  if (!json_get(root, "error", &err) || !err.data || err.len == 0 ||
+      err.data[0] != '{') {
+    return 0;
+  }
+
+  JsonSlice message = {0};
+  if (!json_get(err, "message", &message) || !message.data || message.len == 0)
+    return 0;
+
+  JsonSlice code = {0};
+  if (json_get(err, "code", &code) && code.data && code.len > 0) {
+    cclaw_strerror(CCLAW_INVALID, "%s error (%.*s): %.*s", ctx->provider->name,
+                   (int)code.len, code.data, (int)message.len, message.data);
+  } else {
+    cclaw_strerror(CCLAW_INVALID, "%s error: %.*s", ctx->provider->name,
+                   (int)message.len, message.data);
+  }
+
+  return 1;
+}
+
+Response cclaw_response_error_from_json(const CClawString json) {
+  char *str = json.str;
+  str[json.len] = '\0';
+
+  JsonSlice root = json_from_cstr(str);
+  JsonSlice error;
+  Response res = {0};
+
+  if (json_get(root, "error", &error)) {
+    json_get(error, "message", &res.error.message);
+    json_get(error, "type", &res.error.type);
+    json_get(error, "param", &res.error.param);
+    json_get(error, "code", &res.error.code);
+    return res;
+  }
+
+  return res;
+}
 
 Response cclaw_response_from_json(const CClawString json) {
   char *str = json.str;
@@ -16,7 +61,6 @@ Response cclaw_response_from_json(const CClawString json) {
   json_get(root, "status", &res.status);
   json_get(root, "background", &res.background);
   json_get(root, "completed_at", &res.completed_at);
-  json_get(root, "error", &res.error);
   json_get(root, "frequency_penalty", &res.frequency_penalty);
   json_get(root, "incomplete_details", &res.incomplete_details);
   json_get(root, "instructions", &res.instructions);
@@ -53,6 +97,9 @@ Response cclaw_response_from_json(const CClawString json) {
       json_get(outputItem, "type", &res.output[i].type);
       json_get(outputItem, "summary", &res.output[i].summary);
       json_get(outputItem, "role", &res.output[i].role);
+      json_get(outputItem, "call_id", &res.output[i].call_id);
+      json_get(outputItem, "name", &res.output[i].name);
+      json_get(outputItem, "arguments", &res.output[i].arguments);
       if (json_get(outputItem, "content", &content)) {
         json_array_iter_init(content, &contents);
         size_t j = 0;
