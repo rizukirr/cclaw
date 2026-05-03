@@ -12,6 +12,17 @@ This repository allows autonomous coding agents to operate with these defaults:
 
 CClaw — LLM-agnostic agentic AI framework in C11. Early phase: single-provider (OpenAI Responses API) synchronous `chat()` works; the architecture is being built toward multi-provider vtable + ReAct agent loop and will scale to Agent Memory.
 
+## Roadmap priority
+
+The project targets a **harness layer first** — a parallel, extensible runner that hosts agent processes, dispatches tool calls concurrently, and exposes clean extension points (providers, tools, transports). Once the harness is solid, we build **OpenClaw** on top: a Claude-Code-style coding agent that consumes the harness as its execution substrate.
+
+Order of work:
+
+1. **Harness layer** — provider vtable, tool vtable, parallel tool dispatch, streaming, arena-scoped agent runs, extension registration. Must be reusable by any agent built on top.
+2. **OpenClaw agent** — opinionated coding agent (REPL/CLI, tool suite, prompt scaffolding, session memory) implemented as a *consumer* of the harness, not baked into core.
+
+When in doubt, ask: "does this belong in the harness (generic, parallel, extensible) or in the agent (opinionated, product-shaped)?" Harness code must not assume the OpenClaw agent exists.
+
 ## Build, run, test
 
 ```bash
