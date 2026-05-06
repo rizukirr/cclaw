@@ -57,11 +57,48 @@ typedef struct {
   char model[MODEL_MAX];
 } OpenAIImpl;
 
+/**
+ * @brief Compare a JsonSlice against a NUL-terminated literal for byte
+ * equality.
+ *
+ * Used throughout the OpenAI parser to dispatch on JSON `type` discriminator
+ * strings (e.g. "function_call", "response.output_text.delta") without
+ * allocating a temporary C string.
+ *
+ * @param s    JSON slice to compare. A slice with `s.data == NULL` always
+ *             compares unequal.
+ * @param lit  NUL-terminated literal to compare against. Must be non-NULL.
+ *
+ * @return  Non-zero if the slice's bytes match @p lit exactly (same length
+ *          and same content), zero otherwise.
+ */
 static int json_slice_eq_lit(JsonSlice s, const char *lit) {
   size_t n = strlen(lit);
   return s.data && s.len == n && memcmp(s.data, lit, n) == 0;
 }
 
+/**
+ * @brief Resolve a model-emitted tool call to a registered tool and run it.
+ *
+ * Looks up @p src->name in the CClaw tool registry, invokes the matched
+ * tool's callback with the model-supplied JSON arguments, and copies the
+ * tool's textual result into @p dest.
+ *
+ * @param ctx       CClaw context owning the tool registry. Must be non-NULL.
+ * @param src       Parsed `function_call` Output describing the tool the
+ *                  model wants to invoke. Must be non-NULL with a populated
+ *                  `name` slice.
+ * @param dest      Caller-provided buffer that receives the tool result as a
+ *                  NUL-terminated string. Must be non-NULL.
+ * @param dest_len  Capacity of @p dest in bytes, including the NUL.
+ *
+ * @return  0 on success; CCLAW_INVALID if inputs are malformed or the tool
+ *          name is not registered; the tool callback's non-zero return code
+ *          if the callback itself fails.
+ *
+ * @note    Errors are also reported via cclaw_strerror so the caller can
+ *          surface a human-readable diagnostic.
+ */
 static int openai_dispatch_tool_call(CClaw *ctx, const Output *src, char *dest,
                                      size_t dest_len) {
   if (!ctx || !src || !src->name.data) {
@@ -95,6 +132,20 @@ static int openai_dispatch_tool_call(CClaw *ctx, const Output *src, char *dest,
   return CCLAW_INVALID;
 }
 
+/**
+ * @brief Project the streaming tool-call accumulator into an Output struct.
+ *
+ * Wraps the function name, call_id, and arguments accumulated across
+ * streaming SSE events into an Output suitable for handing to
+ * openai_dispatch_tool_call(). The Output's slices borrow from @p st and
+ * remain valid only while @p st is live and unmodified.
+ *
+ * @param st   Streaming context whose `tool_ctx` holds the accumulated call.
+ *             Must be non-NULL.
+ * @param out  Destination Output to populate. Must be non-NULL.
+ *
+ * @return  0 on success, CCLAW_INVALID if either argument is NULL.
+ */
 static int openai_stream_tool_result(OpenAIStreamCtx *st, Output *out) {
   if (!st || !out)
     return CCLAW_INVALID;
@@ -110,13 +161,40 @@ static int openai_stream_tool_result(OpenAIStreamCtx *st, Output *out) {
   return 0;
 }
 
+/**
+ * @brief Process one fully-buffered SSE `data:` payload from the OpenAI stream.
+ *
+ * Parses the JSON in `st->data_buf` and reacts to the event `type` field:
+ *   - `response.created` / `response.in_progress`: capture the response id
+ *     (needed later to chain a tool-result follow-up request).
+ *   - `response.output_text.delta`: forward the text chunk to the user
+ *     callback `st->on_chunk`.
+ *   - `response.error`: mark the stream failed.
+ *   - `response.output_item.added` (function_call): begin accumulating a
+ *     tool call (capture call_id and function name).
+ *   - `response.function_call_arguments.done`: finalize accumulated
+ *     arguments and transition the tool state to READY.
+ *
+ * When the tool state reaches READY, the call is dispatched via
+ * openai_dispatch_tool_call() and the state advances to DONE so the outer
+ * stream driver can issue the follow-up `function_call_output` request.
+ *
+ * On exit, the event/data line buffers are reset to receive the next event.
+ *
+ * @param st  Streaming context. Must be non-NULL with `data_buf`/`data_len`
+ *            populated.
+ *
+ * @return  0 on success or when the user callback signals continue; -1 if
+ *          the user callback aborts the stream or a `response.error` is
+ *          observed; non-zero error code from openai_dispatch_tool_call() if
+ *          tool execution fails.
+ */
 static int openai_stream_dispatch(OpenAIStreamCtx *st) {
   if (st->data_len == 0)
     return 0;
 
   st->data_buf[st->data_len] = '\0';
   JsonSlice root = json_from_cstr(st->data_buf);
-
   JsonSlice type = {0}, call_id = {0}, function_name = {0};
 
   int gettype = json_get(root, "type", &type);
@@ -125,6 +203,7 @@ static int openai_stream_dispatch(OpenAIStreamCtx *st) {
                   json_slice_eq_lit(type, "response.in_progress"))) {
     JsonSlice response = {0};
     JsonSlice response_id = {0};
+
     if (json_get(root, "response", &response) &&
         json_get(response, "id", &response_id) && response_id.data &&
         response_id.len > 0) {
@@ -141,12 +220,15 @@ static int openai_stream_dispatch(OpenAIStreamCtx *st) {
         return -1;
       }
     }
-  } else if (gettype && json_slice_eq_lit(type, "response.error")) {
+  }
+
+  if (gettype && json_slice_eq_lit(type, "response.error")) {
     st->failed = 1;
     cclaw_strerror(CCLAW_ERR_NETWORK, "openai stream returned response.error");
     return -1;
-  } else if (gettype && json_slice_eq_lit(type, "response.output_item.added")) {
+  }
 
+  if (gettype && json_slice_eq_lit(type, "response.output_item.added")) {
     JsonSlice item = {0};
     if (json_get(root, "item", &item)) {
       JsonSlice inner_type = {0};
@@ -202,6 +284,26 @@ static int openai_stream_dispatch(OpenAIStreamCtx *st) {
   return 0;
 }
 
+/**
+ * @brief Consume one complete SSE line from the line buffer.
+ *
+ * Implements the line-oriented half of the SSE framing protocol:
+ *   - An empty line dispatches the accumulated event by calling
+ *     openai_stream_dispatch().
+ *   - A line beginning with `event:` captures the event name into
+ *     `st->event_buf`.
+ *   - A line beginning with `data:` appends the payload to `st->data_buf`,
+ *     joining multiple `data:` lines with `\n` per the SSE spec.
+ *   - All other lines (including comments beginning with `:`) are ignored.
+ *
+ * The line buffer itself is reset by the caller after this function returns.
+ *
+ * @param st  Streaming context with `line_buf`/`line_len` holding the line
+ *            (NUL terminator written here). Must be non-NULL.
+ *
+ * @return  0 on success; CCLAW_ERR_OOM if the data buffer would overflow;
+ *          forwards any non-zero return from openai_stream_dispatch().
+ */
 static int openai_stream_consume_line(OpenAIStreamCtx *st) {
   st->line_buf[st->line_len] = '\0';
 
@@ -246,6 +348,30 @@ static int openai_stream_consume_line(OpenAIStreamCtx *st) {
   return 0;
 }
 
+/**
+ * @brief Serialize an OpenAI Responses API request body into @p buf.
+ *
+ * Builds the JSON document POSTed to /v1/responses for the initial turn:
+ * model, optional `stream:true`, the tool schema array (when tools are
+ * registered on @p ctx), the hard-coded developer message, and the user
+ * prompt.
+ *
+ * @param ctx     CClaw context whose registered tools are advertised to the
+ *                model. May be NULL or empty (no `tools` array is emitted).
+ * @param s       OpenAI provider implementation (for `model`). Must be
+ *                non-NULL.
+ * @param prompt  User prompt text. Must be non-NULL.
+ * @param buf     Caller-provided output buffer. Must be non-NULL.
+ * @param cap     Capacity of @p buf in bytes.
+ * @param stream  When non-zero, emits `"stream": true` so the server uses
+ *                Server-Sent Events.
+ *
+ * @return  Pointer into @p buf containing the NUL-terminated JSON body on
+ *          success, or NULL if the writer overflowed @p buf.
+ *
+ * @note    The returned pointer aliases @p buf and is valid only while @p
+ *          buf remains live and unmodified by the caller.
+ */
 static char *openai_build_body(CClaw *ctx, OpenAIImpl *s, const char *prompt,
                                char *buf, size_t cap, int stream) {
   JsonWriter w;
@@ -291,6 +417,28 @@ static char *openai_build_body(CClaw *ctx, OpenAIImpl *s, const char *prompt,
   return (char *)json_writer_output(&w);
 }
 
+/**
+ * @brief Serialize a follow-up `function_call_output` request body (blocking).
+ *
+ * Builds the JSON sent to /v1/responses to deliver a tool result back to the
+ * model after a tool call resolved during the blocking openai_chat() path.
+ * The request chains to the prior turn via `previous_response_id`.
+ *
+ * @param s             OpenAI provider implementation (for `model`). Must be
+ *                      non-NULL.
+ * @param call_id       The `call_id` echoed back from the model's
+ *                      function_call. Must be a NUL-terminated C string.
+ * @param tool_result   Textual output produced by the tool callback. Must be
+ *                      a NUL-terminated C string.
+ * @param buf           Caller-provided output buffer. Must be non-NULL.
+ * @param cap           Capacity of @p buf in bytes.
+ * @param chat_id_buf   The previous response id to chain against. Must be a
+ *                      NUL-terminated C string.
+ * @param char_id_len   Currently unused (reserved for future bounds checks).
+ *
+ * @return  Pointer into @p buf with the JSON body on success, NULL on
+ *          writer overflow.
+ */
 static char *openai_build_tool_result_body(OpenAIImpl *s, const char *call_id,
                                            const char *tool_result, char *buf,
                                            size_t cap, char *chat_id_buf,
@@ -315,6 +463,22 @@ static char *openai_build_tool_result_body(OpenAIImpl *s, const char *call_id,
   return json_writer_ok(&w) ? (char *)json_writer_output(&w) : NULL;
 }
 
+/**
+ * @brief HTTP transport callback that feeds raw bytes into the SSE line parser.
+ *
+ * Invoked by the HTTP layer for each chunk of response body received over
+ * the streaming connection. Performs CRLF normalization (drops `\r`),
+ * splits on `\n`, and forwards each completed line to
+ * openai_stream_consume_line().
+ *
+ * @param chunk     Pointer to the received bytes. Need not be
+ *                  NUL-terminated.
+ * @param len       Number of valid bytes at @p chunk.
+ * @param userdata  Opaque pointer; must point to an OpenAIStreamCtx.
+ *
+ * @return  0 to continue receiving, -1 to abort the HTTP stream (set when
+ *          the line buffer overflows or a downstream callback fails).
+ */
 static int openai_http_stream_cb(const char *chunk, size_t len,
                                  void *userdata) {
   OpenAIStreamCtx *st = (OpenAIStreamCtx *)userdata;
@@ -338,6 +502,23 @@ static int openai_http_stream_cb(const char *chunk, size_t len,
   return 0;
 }
 
+/**
+ * @brief Serialize a follow-up `function_call_output` request body (streaming).
+ *
+ * Variant of openai_build_tool_result_body() used by the streaming path:
+ * always sets `stream:true` and pulls call_id, tool_result, and the previous
+ * response_id directly from the streaming tool accumulator.
+ *
+ * @param s         OpenAI provider implementation (for `model`). Must be
+ *                  non-NULL.
+ * @param tool_ctx  Snapshot of the streaming tool accumulator (passed by
+ *                  value; the caller's copy is unaffected).
+ * @param buf       Caller-provided output buffer. Must be non-NULL.
+ * @param cap       Capacity of @p buf in bytes.
+ *
+ * @return  Pointer into @p buf with the JSON body on success, NULL on
+ *          writer overflow.
+ */
 static char *openai_build_stream_tool_result_body(
     OpenAIImpl *s, const OpenAIStreamToolCtx tool_ctx, char *buf, size_t cap) {
   JsonWriter w;
@@ -361,6 +542,26 @@ static char *openai_build_stream_tool_result_body(
   return json_writer_ok(&w) ? (char *)json_writer_output(&w) : NULL;
 }
 
+/**
+ * @brief POST a JSON body to the OpenAI Responses endpoint and drive the SSE
+ * loop.
+ *
+ * Hands the request body to the HTTP transport with
+ * openai_http_stream_cb() as the chunk callback. After the HTTP call
+ * returns, flushes any trailing partial line and any unterminated `data:`
+ * payload through the parser so events that lack a final blank line are
+ * still dispatched.
+ *
+ * @param s     OpenAI provider implementation (for `api_key`). Must be
+ *              non-NULL.
+ * @param st    Streaming context that accumulates parser state across this
+ *              and any chained follow-up calls. Must be non-NULL.
+ * @param json  NUL-terminated JSON request body. Must be non-NULL.
+ *
+ * @return  0 on a clean stream; CCLAW_INVALID if inputs are NULL;
+ *          CCLAW_ERR_NETWORK if the HTTP transport, line dispatch, or final
+ *          flush fails, or if the parser flagged `st->failed`.
+ */
 static int openai_http_post_stream(OpenAIImpl *s, OpenAIStreamCtx *st,
                                    char *json) {
   if (!s || !json)
@@ -388,6 +589,29 @@ static int openai_http_post_stream(OpenAIImpl *s, OpenAIStreamCtx *st,
   return 0;
 }
 
+/**
+ * @brief Streaming chat entry point installed on the provider vtable.
+ *
+ * Issues the initial streaming request and forwards text deltas to @p
+ * on_chunk in real time. If the model responds with a tool call, the call
+ * is dispatched against the CClaw tool registry and a second streaming
+ * request is sent carrying the tool result, whose deltas continue to flow
+ * through @p on_chunk.
+ *
+ * @param ctx       CClaw context (tool registry source). Must be non-NULL
+ *                  if tools are expected.
+ * @param self      The provider whose `impl` is an OpenAIImpl. Must be
+ *                  non-NULL.
+ * @param prompt    User prompt. Must be non-NULL and shorter than the JSON
+ *                  body buffer can accommodate.
+ * @param on_chunk  Callback invoked for each text delta. Returning non-zero
+ *                  aborts the stream.
+ * @param userdata  Opaque pointer forwarded verbatim to @p on_chunk.
+ *
+ * @return  0 on success; CCLAW_ERR_PARSE if either request body fails to
+ *          serialize; otherwise the error code from
+ *          openai_http_post_stream().
+ */
 static int openai_chat_stream(CClaw *ctx, CClawProvider *self,
                               const char *prompt, CClawStreamCallback on_chunk,
                               void *userdata) {
@@ -444,6 +668,28 @@ static int openai_chat_stream(CClaw *ctx, CClawProvider *self,
   return 0;
 }
 
+/**
+ * @brief Blocking chat entry point installed on the provider vtable.
+ *
+ * Sends a single non-streaming POST to the Responses API and inspects the
+ * parsed reply. If the reply contains a `function_call`, the tool is run
+ * via openai_dispatch_tool_call() and a second blocking request is sent
+ * carrying the tool result; the second response replaces the first as the
+ * returned value.
+ *
+ * @param ctx     CClaw context (tool registry + error reporting). Must be
+ *                non-NULL.
+ * @param self    The provider whose `impl` is an OpenAIImpl. Must be
+ *                non-NULL.
+ * @param prompt  User prompt. Must be non-NULL.
+ *
+ * @return  CClawString owning the raw HTTP response body on success
+ *          (caller is responsible for freeing per CClawString conventions),
+ *          or `{NULL, 0}` if request serialization fails or the network
+ *          call returns no bytes. If a tool call is dispatched but the
+ *          follow-up request returns no bytes, the original response is
+ *          returned.
+ */
 static CClawString openai_chat(CClaw *ctx, CClawProvider *self,
                                const char *prompt) {
   OpenAIImpl *s = (OpenAIImpl *)self->impl;
@@ -499,6 +745,15 @@ static CClawString openai_chat(CClaw *ctx, CClawProvider *self,
   return res;
 }
 
+/**
+ * @brief Free entry point installed on the provider vtable.
+ *
+ * Zeroes the OpenAIImpl (so the API key does not linger in freed memory),
+ * frees the impl, and frees the provider itself. Safe to call with NULL.
+ *
+ * @param self  Provider previously returned by cclaw_provider_openai(),
+ *              or NULL.
+ */
 static void openai_free(CClawProvider *self) {
   if (!self)
     return;
@@ -509,6 +764,10 @@ static void openai_free(CClawProvider *self) {
   free(self);
 }
 
+/**
+ * @brief Construct an OpenAI-backed CClawProvider. See openai.h for the
+ *        full contract.
+ */
 CClawProvider *cclaw_provider_openai(const CClawProviderConfig *cfg) {
   if (!cfg || !cfg->api_key || !cfg->model)
     return NULL;

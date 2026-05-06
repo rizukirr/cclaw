@@ -44,10 +44,13 @@ if(WIN32)
     set(BUILD_SHARED_LIBS          OFF CACHE BOOL "" FORCE)
     set(BUILD_CURL_EXE             OFF CACHE BOOL "" FORCE)
     set(CURL_USE_SCHANNEL          ON  CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES             OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING              OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(curl
         URL https://github.com/curl/curl/releases/download/curl-8_11_1/curl-8.11.1.tar.xz
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(curl)
+    unset(BUILD_TESTING CACHE)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
@@ -78,19 +81,27 @@ endif()
 
 # ── cclaw library ───────────────────
 
-add_library(cclaw_lib STATIC
+set(CCLAW_SOURCES
     src/core/cclaw.c
     src/core/response.c
     src/core/error.c
     src/net/http.c
     src/provider/openai.c
     src/provider/registry.c
-    src/tui/tui.c
     src/tui/repl.c
 )
 
+if(NOT WIN32)
+    list(APPEND CCLAW_SOURCES src/tui/tui.c)
+endif()
 
-set_source_files_properties(src/tui/tui.c PROPERTIES COMPILE_FLAGS "-Wno-conversion -Wno-sign-conversion -Wno-shadow -Wno-double-promotion -Wno-unused-function")
+add_library(cclaw_lib STATIC ${CCLAW_SOURCES})
+
+if(WIN32)
+    target_compile_definitions(cclaw_lib PUBLIC CCLAW_NO_TUI)
+else()
+    set_source_files_properties(src/tui/tui.c PROPERTIES COMPILE_FLAGS "-Wno-conversion -Wno-sign-conversion -Wno-shadow -Wno-double-promotion -Wno-unused-function")
+endif()
 
 target_include_directories(cclaw_lib
     PUBLIC

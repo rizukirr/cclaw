@@ -7,7 +7,6 @@
 static int tool_add(const char *args_json, size_t args_len, char *out,
                     size_t out_cap, void *user) {
 
-  fprintf(stderr, "tool_add: %s\n", args_json);
   char buf[args_len + 1];
   size_t buf_len = str_skip_escaped((char *)args_json, args_len, buf);
 
